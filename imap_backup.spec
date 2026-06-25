@@ -1,7 +1,7 @@
 # -*- mode: python ; coding: utf-8 -*-
-# PyInstaller spec for the EAHI IMAP Backup app.
-#   macOS   -> dist/IMAP Backup.app   (double-click bundle)
-#   Windows -> dist/IMAP Backup.exe   (single file)
+# PyInstaller spec for the EAHI Data Backup app.
+#   macOS   -> dist/Data Backup.app   (double-click bundle)
+#   Windows -> dist/Data Backup.exe   (single file)
 # Build with:  pyinstaller --clean --noconfirm imap_backup.spec
 # (run the matching build_mac.sh / build_windows.bat — they set up the venv)
 import os, sys
@@ -24,13 +24,13 @@ pyz = PYZ(a.pure)
 
 if sys.platform == 'win32':
     # one-file .exe — everything bundled into a single distributable file
-    exe = EXE(pyz, a.scripts, a.binaries, a.datas, [], name='IMAP Backup',
+    exe = EXE(pyz, a.scripts, a.binaries, a.datas, [], name='Data Backup',
               console=False, icon=icon, upx=False)
 else:
     # one-dir + .app bundle on macOS
-    exe = EXE(pyz, a.scripts, [], exclude_binaries=True, name='IMAP Backup',
+    exe = EXE(pyz, a.scripts, [], exclude_binaries=True, name='Data Backup',
               console=False, icon=icon, upx=False)
-    coll = COLLECT(exe, a.binaries, a.datas, name='IMAP Backup', upx=False)
+    coll = COLLECT(exe, a.binaries, a.datas, name='Data Backup', upx=False)
     if sys.platform == 'darwin':
-        app = BUNDLE(coll, name='IMAP Backup.app',
+        app = BUNDLE(coll, name='Data Backup.app',
                      bundle_identifier='com.eahi.imapbackup', icon=icon)
