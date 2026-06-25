@@ -1,0 +1,26 @@
+# --- secrets / credentials (NEVER commit) ---
+.env
+*.key
+credentials*.json
+service-account*.json
+token_*.json
+
+# --- people's backup data & ledgers (NEVER commit) ---
+*.sqlite
+*.eml
+*.vcf
+*.ics
+*.mbox
+*.pst
+# default per-user backup output folders
+*@*/
+
+# --- build artifacts ---
+build/
+dist/
+build-venv/
+__pycache__/
+*.pyc
+
+# --- OS cruft ---
+.DS_Store
