@@ -28,6 +28,7 @@ import argparse, base64, os, re, ssl, sys, getpass
 import urllib.request, urllib.error
 from urllib.parse import urljoin, urlparse
 import xml.etree.ElementTree as ET
+from utils import translate_error
 
 NS = {"d": "DAV:", "c": "urn:ietf:params:xml:ns:caldav", "a": "urn:ietf:params:xml:ns:carddav"}
 VERBOSE = True
@@ -72,7 +73,7 @@ def dav(method, url, user, pw, body=None, depth=None, timeout=30, _hops=0):
                 return dav(method, urljoin(url, loc), user, pw, body, depth, timeout, _hops + 1)
         return e.code, dict(e.headers or {}), (e.read().decode("utf-8", "replace") if e.fp else ""), url
     except Exception as e:
-        return -1, {}, "ERROR: %s" % e, url
+        return -1, {}, "ERROR: %s" % translate_error(e), url
 
 # ---- XML helpers ------------------------------------------------------------
 def parse_multistatus(xml_text):
@@ -168,7 +169,7 @@ def discover_calendar_home(user, pw, explicit_url=None):
     return homes
 
 # ---- enumerate + download ---------------------------------------------------
-def backup_caldav(user, pw, dest, explicit_url=None):
+def backup_caldav(user, pw, dest, explicit_url=None, progress=None):
     box = os.path.join(dest, user)
     cal_dir = os.path.join(box, "Calendar")
     task_dir = os.path.join(box, "Tasks")
@@ -203,27 +204,27 @@ def backup_caldav(user, pw, dest, explicit_url=None):
         log("\n! No calendar collections found to enumerate.")
         return 2
 
+    # First, gather ALL objects to be fetched across all collections for progress tracking
+    all_to_fetch = []
     for coll in collections:
-        log("\n# PROPFIND Depth:1 (list objects)  ->  %s" % coll)
         st, _, txt, _ = dav("PROPFIND", coll, user, pw, BODY_RESOURCES, depth=1)
-        log("  HTTP %s" % st)
-        if st != 207:
-            vlog("  " + txt[:600].replace("\n", "\n  "))
-            continue
-        hrefs = []
-        for href, resp in parse_multistatus(txt):
-            ctype_el = resp.find(".//d:getcontenttype", NS)
-            ctype = (ctype_el.text or "") if ctype_el is not None else ""
-            if href.lower().endswith(".ics") or "calendar" in ctype.lower():
-                hrefs.append(href)
-        log("  %d object(s) to fetch" % len(hrefs))
-        for href in hrefs:
-            url = urljoin(coll, href)
-            st, _, body, _ = dav("GET", url, user, pw)
-            if st != 200 or not body.strip():
-                saved["fail"] += 1
-                vlog("    GET %s -> HTTP %s" % (href, st))
-                continue
+        if st == 207:
+            for href, resp in parse_multistatus(txt):
+                ctype_el = resp.find(".//d:getcontenttype", NS)
+                ctype = (ctype_el.text or "") if ctype_el is not None else ""
+                if href.lower().endswith(".ics") or "calendar" in ctype.lower():
+                    all_to_fetch.append((coll, href))
+
+    total = len(all_to_fetch)
+    log("  %d total object(s) to fetch" % total)
+
+    for i, (coll, href) in enumerate(all_to_fetch, 1):
+        url = urljoin(coll, href)
+        st, _, body, _ = dav("GET", url, user, pw)
+        if st != 200 or not body.strip():
+            saved["fail"] += 1
+            vlog("    GET %s -> HTTP %s" % (href, st))
+        else:
             if "BEGIN:VTODO" in body:
                 outdir, kind = task_dir, "VTODO"
             elif "BEGIN:VEVENT" in body:
@@ -237,6 +238,9 @@ def backup_caldav(user, pw, dest, explicit_url=None):
             with open(os.path.join(outdir, fn), "w", encoding="utf-8") as fh:
                 fh.write(body)
             saved[kind] += 1
+        
+        if progress:
+            progress(i, total)
 
     log("\n================ RESULT ================")
     log("  Calendar events (VEVENT): %d  -> %s" % (saved["VEVENT"], cal_dir))
@@ -294,7 +298,7 @@ def diagnose(user, pw, url):
     log("\n(Read the DAV: line and the GET result above — that tells us what this endpoint really is.)")
 
 
-def backup_carddav(user, pw, dest, host):
+def backup_carddav(user, pw, dest, host, progress=None):
     """Best-effort CardDAV contacts pull -> <dest>/<user>/Address book/*.vcf."""
     box = os.path.join(dest, user)
     addr_dir = os.path.join(box, "Address book")
@@ -321,32 +325,42 @@ def backup_carddav(user, pw, dest, host):
             rt = resp.find(".//d:resourcetype", NS)
             if rt is not None and rt.find("a:addressbook", NS) is not None:
                 collections.append(urljoin(home, href))
-    saved = 0
+    
+    # Gather all contacts to be fetched for progress tracking
+    all_to_fetch = []
     for coll in collections:
-        log("# PROPFIND Depth:1 (contacts)  ->  %s" % coll)
         st, _, txt, _ = dav("PROPFIND", coll, user, pw, BODY_RESOURCES, depth=1)
-        if st != 207:
-            continue
-        coll_path = urlparse(coll).path.rstrip("/")
-        for href, resp in parse_multistatus(txt):
-            if href.endswith("/") or urlparse(urljoin(coll, href)).path.rstrip("/") == coll_path:
-                continue
-            u = urljoin(coll, href)
-            st2, _, body, _ = dav("GET", u, user, pw)
-            if st2 == 200 and "BEGIN:VCARD" in body:
-                os.makedirs(addr_dir, exist_ok=True)
-                fn = re.sub(r'[\\/:*?"<>|]+', "_", os.path.basename(href.rstrip("/"))) or ("%d.vcf" % saved)
-                if not fn.lower().endswith(".vcf"):
-                    fn += ".vcf"
-                with open(os.path.join(addr_dir, fn), "w", encoding="utf-8") as fh:
-                    fh.write(body)
-                saved += 1
+        if st == 207:
+            coll_path = urlparse(coll).path.rstrip("/")
+            for href, resp in parse_multistatus(txt):
+                if href.endswith("/") or urlparse(urljoin(coll, href)).path.rstrip("/") == coll_path:
+                    continue
+                all_to_fetch.append((coll, href))
+    
+    total = len(all_to_fetch)
+    log("  %d contact(s) to fetch" % total)
+    saved = 0
+    for i, (coll, href) in enumerate(all_to_fetch, 1):
+        u = urljoin(coll, href)
+        st2, _, body, _ = dav("GET", u, user, pw)
+        if st2 == 200 and "BEGIN:VCARD" in body:
+            os.makedirs(addr_dir, exist_ok=True)
+            fn = re.sub(r'[\\/:*?"<>|]+', "_", os.path.basename(href.rstrip("/"))) or ("%d.vcf" % saved)
+            if not fn.lower().endswith(".vcf"):
+                fn += ".vcf"
+            with open(os.path.join(addr_dir, fn), "w", encoding="utf-8") as fh:
+                fh.write(body)
+            saved += 1
+        
+        if progress:
+            progress(i, total)
+
     log("  Contacts (vCard): %d  -> %s" % (saved, addr_dir))
     return saved
 
 
 def backup_dav(user, pw, dest, caldav_host="am1.myprofessionalmail.com",
-               do_contacts=True, insecure=False, log_fn=None):
+               do_contacts=True, insecure=False, log_fn=None, progress=None):
     """One call for the GUI: CalDAV (calendar + tasks) + CardDAV (contacts) via
     RFC 6764 well-known discovery. The server returns the authenticated user
     principal automatically -- only email + password needed. Returns a summary."""
@@ -356,12 +370,17 @@ def backup_dav(user, pw, dest, caldav_host="am1.myprofessionalmail.com",
     if insecure:
         SSL_CTX = ssl._create_unverified_context()
     base = "https://%s/.well-known/caldav" % caldav_host
-    cal = backup_caldav(user, pw, dest, base)
+    
+    # We can't easily combine progress across both calls into one 0-100% bar 
+    # without pre-counting everything, so we just let them each use the bar.
+    # The bar will reset for contacts.
+    cal = backup_caldav(user, pw, dest, base, progress=progress)
     contacts = 0
     if do_contacts:
-        contacts = backup_carddav(user, pw, dest, "https://%s" % caldav_host)
-    return {"events": cal.get("VEVENT", 0), "tasks": cal.get("VTODO", 0),
-            "contacts": contacts, "fail": cal.get("fail", 0)}
+        contacts = backup_carddav(user, pw, dest, "https://%s" % caldav_host, progress=progress)
+    return {"events": cal.get("VEVENT", 0) if isinstance(cal, dict) else 0, 
+            "tasks": cal.get("VTODO", 0) if isinstance(cal, dict) else 0,
+            "contacts": contacts, "fail": cal.get("fail", 0) if isinstance(cal, dict) else 0}
 
 
 def main():

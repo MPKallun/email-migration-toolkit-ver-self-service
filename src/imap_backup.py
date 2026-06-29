@@ -38,6 +38,7 @@ CLI USAGE
 import argparse, getpass, imaplib, os, re, socket, sqlite3, sys, time
 import ssl as _ssl
 from collections import defaultdict
+from utils import translate_error, retry, log_debug
 
 imaplib._MAXLINE = 10_000_000          # some folders return very long UID lists
 
@@ -148,8 +149,27 @@ def backup(host, port, ssl, user, password, dest, dry_run=False, only=None,
     only = only or []
     ctx = _ssl._create_unverified_context() if insecure else None
     _log = (lambda s: log(s)) if log else (lambda s: None)
-    _prog = progress or (lambda d, t: None)
     _stop = should_stop or (lambda: False)
+    
+    if progress:
+        import inspect
+        try:
+            sig = inspect.signature(progress)
+            params = list(sig.parameters.values())
+            has_var_positional = any(p.kind == inspect.Parameter.VAR_POSITIONAL for p in params)
+            if has_var_positional or len(params) >= 3:
+                _prog = progress
+            else:
+                _prog = lambda d, t, b=0: progress(d, t)
+        except Exception:
+            def _prog_wrapper(d, t, b=0):
+                try:
+                    progress(d, t, b)
+                except TypeError:
+                    progress(d, t)
+            _prog = _prog_wrapper
+    else:
+        _prog = lambda d, t, b=0: None
 
     box_root = os.path.join(dest, user)
     eml_root = os.path.join(box_root, "E-Mails")
@@ -161,11 +181,18 @@ def backup(host, port, ssl, user, password, dest, dry_run=False, only=None,
     try:
         M = connect(host, port, ssl, user, password, ssl_ctx=ctx)
     except Exception as e:
-        _log("LOGIN FAILED for %s @ %s:%d -> %s" % (user, host, port, e))
-        return {"ok": False, "exit": 2, "error": str(e), "dest": box_root}
+        clean_err = translate_error(e)
+        _log("LOGIN FAILED for %s: %s" % (user, clean_err))
+        return {"ok": False, "exit": 2, "error": clean_err, "dest": box_root}
 
     # discover folders
-    typ, raw = M.list()
+    try:
+        typ, raw = M.list()
+    except Exception as e:
+        clean_err = translate_error(e)
+        _log(f"FOLDER LISTING FAILED for {user}: {clean_err}")
+        return {"ok": False, "exit": 2, "error": clean_err, "dest": box_root}
+
     folders = []
     if typ == "OK":
         for line in raw:
@@ -180,16 +207,22 @@ def backup(host, port, ssl, user, password, dest, dry_run=False, only=None,
             folders.append((name, canonical_dir(flags, name)))
 
     if not folders:
-        M.logout()
+        try: M.logout()
+        except Exception: pass
         _log("No selectable folders found.")
         return {"ok": False, "exit": 2, "error": "no folders", "dest": box_root}
 
     # plan: server counts (also the dry-run output)
     plan, grand = [], 0
     for name, sub in folders:
-        uv, mc = status_count(M, name)
-        plan.append((name, sub, uv, mc))
-        grand += mc
+        try:
+            uv, mc = status_count(M, name)
+            plan.append((name, sub, uv, mc))
+            grand += mc
+        except Exception as e:
+            clean_err = translate_error(e)
+            _log(f"FOLDER STATUS FAILED for {name}: {clean_err}")
+            return {"ok": False, "exit": 2, "error": clean_err, "dest": box_root}
 
     _log("\n%-26s %-12s %10s" % ("SERVER FOLDER", "-> LOCAL", "MESSAGES"))
     _log("-" * 52)
@@ -201,7 +234,8 @@ def backup(host, port, ssl, user, password, dest, dry_run=False, only=None,
 
     if dry_run:
         _log("\nMODE: DRY-RUN (connected + counted; nothing downloaded)")
-        M.logout()
+        try: M.logout()
+        except Exception: pass
         return {"ok": True, "exit": 0, "dry_run": True, "dest": box_root,
                 "server_total": grand, "report": ""}
 
@@ -229,14 +263,21 @@ def backup(host, port, ssl, user, password, dest, dry_run=False, only=None,
             M.select(_q(name), readonly=True)        # read-only: never alters the server
             typ, data = M.uid("SEARCH", None, "ALL")
             uids = data[0].split() if (typ == "OK" and data and data[0]) else []
-        except (imaplib.IMAP4.abort, OSError):
-            reconnect(); M.select(_q(name), readonly=True)
-            typ, data = M.uid("SEARCH", None, "ALL")
-            uids = data[0].split() if (typ == "OK" and data and data[0]) else []
+        except Exception:
+            try:
+                reconnect()
+                M.select(_q(name), readonly=True)
+                typ, data = M.uid("SEARCH", None, "ALL")
+                uids = data[0].split() if (typ == "OK" and data and data[0]) else []
+            except Exception as select_err:
+                clean_err = translate_error(select_err)
+                _log(f"FOLDER ACCESS FAILED for {name}: {clean_err}")
+                return {"ok": False, "exit": 1, "error": clean_err, "dest": box_root}
 
         for uidb in uids:
             if _stop(): stopped = True; break
             uid = int(uidb)
+            bytes_transferred = 0
             if db.execute("SELECT 1 FROM saved WHERE folder=? AND uidvalidity=? AND uid=?",
                           (name, uv, uid)).fetchone():
                 stats[sub]["skip"] += 1
@@ -248,24 +289,34 @@ def backup(host, port, ssl, user, password, dest, dry_run=False, only=None,
                         if typ == "OK" and fdata and isinstance(fdata[0], tuple):
                             raw_msg = fdata[0][1]
                         break
-                    except (imaplib.IMAP4.abort, OSError, socket.error):
+                    except Exception:
                         if attempt == 3:
                             break
-                        reconnect(); M.select(_q(name), readonly=True)
+                        try:
+                            reconnect()
+                            M.select(_q(name), readonly=True)
+                        except Exception:
+                            pass
                 if raw_msg:
                     path = os.path.join(outdir, "%d.eml" % uid)
-                    with open(path, "wb") as fh:
-                        fh.write(raw_msg)
-                    db.execute("INSERT OR IGNORE INTO saved VALUES(?,?,?,?,?)",
-                               (name, uv, uid, path, time.time()))
-                    db.commit()
-                    stats[sub]["new"] += 1
+                    try:
+                        with open(path, "wb") as fh:
+                            fh.write(raw_msg)
+                        db.execute("INSERT OR IGNORE INTO saved VALUES(?,?,?,?,?)",
+                                   (name, uv, uid, path, time.time()))
+                        db.commit()
+                        stats[sub]["new"] += 1
+                        bytes_transferred = len(raw_msg)
+                    except Exception as write_err:
+                        clean_err = translate_error(write_err)
+                        _log(f"FILE WRITE FAILED for {uid}.eml: {clean_err}")
+                        stats[sub]["fail"] += 1
+                        fails.append((name, uid))
                 else:
                     stats[sub]["fail"] += 1
                     fails.append((name, uid))
             done_total += 1
-            if done_total % 25 == 0 or done_total == grand:
-                _prog(done_total, grand)
+            _prog(done_total, grand, bytes_transferred)
         if stopped: break
 
     try: M.logout()

@@ -1,0 +1,106 @@
+import time
+import socket
+import ssl
+import traceback
+import logging
+import os
+from functools import wraps
+
+# Setup background logging
+DEBUG_LOG_FILE = "admin_debug.log"
+logging.basicConfig(
+    filename=DEBUG_LOG_FILE,
+    filemode="a",
+    format="%(asctime)s [%(levelname)s] %(message)s",
+    level=logging.DEBUG
+)
+
+def log_debug(message, exc=None):
+    """Logs detailed debugging information to the file in the background."""
+    if exc:
+        tb = "".join(traceback.format_exception(type(exc), exc, exc.__traceback__))
+        logging.debug(f"{message}\nException Details:\n{tb}")
+    else:
+        logging.debug(message)
+
+def translate_error(e):
+    """
+    Translates raw exceptions into clean, actionable, human-readable error descriptions.
+    Stores the full traceback in admin_debug.log.
+    """
+    log_debug("Translating error", e)
+    
+    msg = str(e)
+    # Check for Google API HttpError (without importing googleapiclient globally to avoid load errors)
+    if e.__class__.__name__ == "HttpError":
+        try:
+            status = getattr(e, "resp", None) and getattr(e.resp, "status", None)
+            content = getattr(e, "content", b"").decode("utf-8", "replace")
+            import json
+            data = json.loads(content)
+            api_msg = data.get("error", {}).get("message", content)
+            
+            if status == 429:
+                return f"Google Workspace Rate Limit Exceeded (429): {api_msg}. Please wait."
+            elif status == 403:
+                if "delegation" in api_msg.lower() or "unauthorized_client" in api_msg.lower():
+                    return "Google Workspace Auth Error (403): Domain-Wide Delegation is not authorized for this service account client ID or scopes."
+                return f"Google Workspace Access Denied (403): {api_msg}."
+            elif status == 404:
+                return f"Google Workspace Not Found (404): {api_msg}. Verify target email or resource exists."
+            elif status == 401:
+                return "Google Workspace Auth Error (401): Invalid or expired access credentials."
+            elif status >= 500:
+                return f"Google Server Error ({status}): {api_msg}. Retrying may resolve it."
+            return f"Google API Error ({status}): {api_msg}"
+        except Exception as json_err:
+            log_debug("Failed parsing HttpError JSON", json_err)
+            return f"Google API Error: {msg}"
+            
+    # Check for common socket / network issues
+    if isinstance(e, socket.timeout):
+        return "Network Timeout: The server took too long to respond. Check your connection."
+    if isinstance(e, (ConnectionRefusedError, ConnectionResetError, ConnectionAbortedError)):
+        return "Connection Failed: The server refused or aborted the connection."
+    if "gaierror" in msg or "getaddrinfo" in msg:
+        return "Network Address Error: Could not resolve server address. Check your internet connection or host settings."
+        
+    # Check for SSL / TLS handshake issues
+    if isinstance(e, ssl.SSLError) or "ssl" in msg.lower() or "cert" in msg.lower():
+        return "SSL/TLS Security Error: Secure connection failed. Try checking 'Skip certificate check' if using self-signed or unverified hosts."
+
+    # Check for file/directory issues
+    if isinstance(e, FileNotFoundError):
+        return f"File Not Found: The specified file or directory path does not exist: {msg}"
+    if isinstance(e, PermissionError):
+        return "Permission Denied: You do not have permissions to access this file or directory."
+
+    # Check for IMAP specific issues
+    if "imap" in e.__class__.__name__.lower() or "login failed" in msg.lower() or "authentication failed" in msg.lower():
+        return "IMAP Authentication Failed: Invalid email address, password, or App Password."
+
+    return msg
+
+def retry(max_attempts=3, delay=1.0, backoff=2.0, exceptions=(Exception,), log_fn=print):
+    """
+    Decorator that retries a function with exponential backoff.
+    Specially logs to a log function (GUI console) when a retry attempt occurs.
+    """
+    def decorator(func):
+        @wraps(func)
+        def wrapper(*args, **kwargs):
+            curr_delay = delay
+            for attempt in range(1, max_attempts + 1):
+                try:
+                    return func(*args, **kwargs)
+                except exceptions as e:
+                    clean_err = translate_error(e)
+                    if attempt == max_attempts:
+                        log_fn(f"❌ Permanent failure after {max_attempts} attempts: {clean_err}")
+                        raise e
+                    log_fn(f"⚠ Attempt {attempt}/{max_attempts} failed: {clean_err}. Retrying in {curr_delay:.1f}s...")
+                    time.sleep(curr_delay)
+                    curr_delay *= backoff
+            return None
+        return wrapper
+    return decorator
