@@ -105,6 +105,36 @@ def translate_error(e):
 
     return msg
 
+def load_dotenv(path=None):
+    """Minimal stdlib .env loader (no python-dotenv dependency -- this project
+    stays pip-install-free). Reads KEY=VALUE lines from a .env file into
+    os.environ. Defaults to '<project root>/.env' (one level up from src/).
+    Never overwrites a variable the user already has set in their real
+    environment. Silently no-ops if the file doesn't exist (e.g. it wasn't
+    created yet -- see .env.example)."""
+    if path is None:
+        src_dir = os.path.dirname(os.path.abspath(__file__))
+        path = os.path.join(os.path.dirname(src_dir), ".env")
+    loaded = {}
+    if not os.path.isfile(path):
+        return loaded
+    try:
+        with open(path, "r", encoding="utf-8") as fh:
+            for line in fh:
+                line = line.strip()
+                if not line or line.startswith("#") or "=" not in line:
+                    continue
+                key, _, value = line.partition("=")
+                key = key.strip()
+                value = value.strip().strip('"').strip("'")
+                if not key:
+                    continue
+                loaded[key] = value
+                os.environ.setdefault(key, value)
+    except OSError as e:
+        log_debug("load_dotenv failed to read %s" % path, e)
+    return loaded
+
 def retry(max_attempts=3, delay=1.0, backoff=2.0, exceptions=(Exception,), log_fn=print):
     """
     Decorator that retries a function with exponential backoff.

@@ -17,7 +17,7 @@ from tkinter import filedialog
 import customtkinter as ctk
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from imap_backup import backup, fold_in_data_export
+from imap_backup import backup, fold_in_data_export, verify_backup, verify_and_repair
 import caldav_backup
 import gmail_upload
 from utils import translate_error, log_debug
@@ -29,12 +29,42 @@ WHITE="#FFFFFF"; TEXT="#1B2B4B"; MUTED="#5F6B7A"; BORDER="#D5DCE6"
 
 ctk.set_appearance_mode("light")
 
+# ---- provider presets --------------------------------------------------
+# (display name, host, default port) -- Mail server dropdown. "Custom"
+# leaves the address field blank & editable; every other choice locks it to
+# a known-good value pulled from each provider's current docs, so it can't
+# be fat-fingered.
+MAIL_PROVIDERS = [
+    ("GoDaddy", "imap.secureserver.net", "993"),
+    ("Titan",   "imap.titan.email",      "993"),
+    ("Gmail",   "imap.gmail.com",        "993"),
+    ("Custom",  "",                      ""),
+]
+# (display name, host, warning-or-"") -- Calendar/contacts (CalDAV/CardDAV)
+# dropdown. am1.myprofessionalmail.com is what this app's Titan/GoDaddy
+# accounts actually use today (Titan's own docs list dav.titan.email as the
+# current standard host -- switch to Custom + that address if you're on a
+# different Titan account and am1 doesn't resolve for you).
+CALDAV_PROVIDERS = [
+    ("GoDaddy", "caldav.secureserver.net",
+     "GoDaddy's CalDAV is calendar-only (no CardDAV) and non-standard — most reliable from Apple clients."),
+    ("Titan",   "am1.myprofessionalmail.com", ""),
+    ("Gmail",   "apidata.googleusercontent.com",
+     "⚠  Google requires OAuth for CalDAV — this app only does password auth, so this will fail today."),
+    ("Custom",  "", ""),
+]
+
+def _provider_labels(providers):
+    """Dropdown option text: 'Service  —  address' so the actual host is
+    visible right in the list, not just the provider name."""
+    return ["%s  —  %s" % (name, host) if host else name for name, host, _ in providers]
+
 
 class App(ctk.CTk):
     def __init__(self):
         super().__init__()
         self.title("EAHI — Data Backup")
-        self.geometry("770x980"); self.minsize(690, 820)
+        self.geometry("770x1210"); self.minsize(690, 900)
         self.configure(fg_color=LIGHT_GREY)
         self.q = queue.Queue()
         self.stop_event = threading.Event()
@@ -44,6 +74,14 @@ class App(ctk.CTk):
         self.insecure_var = tk.BooleanVar(value=False)
         self.transfer_start_time = None
         self.accumulated_bytes = 0
+        self.current_op = "backup"
+        self.google_tokens = None
+
+        # provider-preset lookups: dropdown label -> (name, host, port/note)
+        self._mail_labels = _provider_labels(MAIL_PROVIDERS)
+        self._mail_map = dict(zip(self._mail_labels, MAIL_PROVIDERS))
+        self._caldav_labels = _provider_labels(CALDAV_PROVIDERS)
+        self._caldav_map = dict(zip(self._caldav_labels, CALDAV_PROVIDERS))
 
         self.f_title = ctk.CTkFont(family="Helvetica", size=19, weight="bold")
         self.f_sub   = ctk.CTkFont(family="Helvetica", size=12)
@@ -76,6 +114,27 @@ class App(ctk.CTk):
         ctk.CTkLabel(inner, text="Back up your mailbox — or restore it to Gmail",
                      font=self.f_sub, text_color="#AFC2DA").pack(anchor="w")
         ctk.CTkLabel(h, text="EAHI", font=self.f_btn, text_color="#AFC2DA").grid(row=0, column=1, sticky="e", padx=20)
+
+    # ---- provider dropdowns: fill + lock the address field to the preset,
+    # unlock it only for "Custom" ----
+    def _on_mail_provider(self, choice):
+        name, host, port = self._mail_map[choice]
+        self.host.configure(state="normal")
+        self.host.delete(0, "end")
+        if host:
+            self.host.insert(0, host)
+        if port:
+            self.port.delete(0, "end"); self.port.insert(0, port)
+        self.host.configure(state=("normal" if name == "Custom" else "disabled"))
+
+    def _on_caldav_provider(self, choice):
+        name, host, note = self._caldav_map[choice]
+        self.caldav_host.configure(state="normal")
+        self.caldav_host.delete(0, "end")
+        if host:
+            self.caldav_host.insert(0, host)
+        self.caldav_host.configure(state=("normal" if name == "Custom" else "disabled"))
+        self.caldav_warning.configure(text=note or "")
 
     def _entry(self, master, h=36, show=None):
         e = ctk.CTkEntry(master, height=h, corner_radius=8, fg_color=WHITE,
@@ -122,10 +181,25 @@ class App(ctk.CTk):
         self.do_dav = ctk.CTkSwitch(dfin, text="Back up calendar, contacts & tasks (live)", font=self.f_label,
                                     text_color=TEXT, progress_color=TEAL, onvalue=True, offvalue=False)
         self.do_dav.select(); self.do_dav.pack(anchor="w")
+        cpv = ctk.CTkFrame(dfin, fg_color="transparent"); cpv.pack(fill="x", pady=(10, 0))
+        self._cap(cpv, "Calendar/contacts provider:").pack(anchor="w", pady=(0, 4))
+        self.caldav_provider = ctk.CTkOptionMenu(
+            cpv, values=self._caldav_labels, command=self._on_caldav_provider,
+            fg_color=LIGHT_BLUE, text_color=NAVY, button_color=TEAL, button_hover_color=TEAL_HOVER,
+            dropdown_fg_color=WHITE, dropdown_text_color=TEXT, font=self.f_label, height=32)
+        self.caldav_provider.pack(fill="x")
+
         hrow = ctk.CTkFrame(dfin, fg_color="transparent"); hrow.pack(fill="x", pady=(8, 0)); hrow.grid_columnconfigure(1, weight=1)
-        self._cap(hrow, "Calendar/contacts server:").grid(row=0, column=0, sticky="w")
-        self.caldav_host = self._entry(hrow, h=30); self.caldav_host.insert(0, "am1.myprofessionalmail.com")
+        self._cap(hrow, "Server address:").grid(row=0, column=0, sticky="w")
+        self.caldav_host = self._entry(hrow, h=30)
         self.caldav_host.grid(row=0, column=1, sticky="ew", padx=(8, 0))
+
+        self.caldav_warning = self._cap(dfin, "")
+        self.caldav_warning.configure(text_color=AMBER, wraplength=600, justify="left")
+        self.caldav_warning.pack(anchor="w", pady=(4, 0))
+
+        self.caldav_provider.set(self._caldav_labels[1])          # default: Titan
+        self._on_caldav_provider(self._caldav_labels[1])
 
         av = ctk.CTkFrame(card, fg_color=LIGHT_GREY, corner_radius=10); av.grid(row=4, column=0, sticky="ew", pady=(10, 0), **pad)
         avin = ctk.CTkFrame(av, fg_color="transparent"); avin.pack(fill="x", padx=12, pady=10)
@@ -148,19 +222,38 @@ class App(ctk.CTk):
         self.dry = ctk.CTkSwitch(card, text="Dry run  (test email login & count — no download)", font=self.f_label,
                                  text_color=TEXT, progress_color=TEAL, onvalue=True, offvalue=False)
         self.dry.grid(row=6, column=0, sticky="w", pady=(10, 0), **pad)
+        self.mbox = ctk.CTkSwitch(card, text="Also create importable mailbox (.mbox) files  (uses extra disk space)",
+                                  font=self.f_label, text_color=TEXT, progress_color=TEAL, onvalue=True, offvalue=False)
+        self.mbox.grid(row=7, column=0, sticky="w", pady=(10, 0), **pad)
+        self.auto_verify = ctk.CTkSwitch(card, text="Verify after backup & auto re-download any corrupt/missing files",
+                                         font=self.f_label, text_color=TEXT, progress_color=TEAL,
+                                         onvalue=True, offvalue=False)
+        self.auto_verify.select()
+        self.auto_verify.grid(row=8, column=0, sticky="w", pady=(10, 0), **pad)
 
-        sv = ctk.CTkFrame(card, fg_color="transparent"); sv.grid(row=7, column=0, sticky="ew", pady=(8, 0), **pad)
+        mpv = ctk.CTkFrame(card, fg_color="transparent"); mpv.grid(row=9, column=0, sticky="ew", pady=(8, 0), **pad)
+        self._cap(mpv, "Mail provider:").pack(anchor="w", pady=(0, 4))
+        self.mail_provider = ctk.CTkOptionMenu(
+            mpv, values=self._mail_labels, command=self._on_mail_provider,
+            fg_color=LIGHT_BLUE, text_color=NAVY, button_color=TEAL, button_hover_color=TEAL_HOVER,
+            dropdown_fg_color=WHITE, dropdown_text_color=TEXT, font=self.f_label, height=32)
+        self.mail_provider.pack(fill="x")
+
+        sv = ctk.CTkFrame(card, fg_color="transparent"); sv.grid(row=10, column=0, sticky="ew", pady=(8, 0), **pad)
         sv.grid_columnconfigure(1, weight=1)
-        self._cap(sv, "Mail server:").grid(row=0, column=0, sticky="w")
-        self.host = self._entry(sv, h=30); self.host.insert(0, "imap.secureserver.net")
+        self._cap(sv, "Server address:").grid(row=0, column=0, sticky="w")
+        self.host = self._entry(sv, h=30)
         self.host.grid(row=0, column=1, sticky="ew", padx=(8, 12))
         self._cap(sv, "Port:").grid(row=0, column=2, sticky="e")
-        self.port = self._entry(sv, h=30); self.port.configure(width=66); self.port.insert(0, "993")
+        self.port = self._entry(sv, h=30); self.port.configure(width=66)
         self.port.grid(row=0, column=3, padx=(6, 12))
         self.ssl = ctk.CTkSwitch(sv, text="SSL", font=self.f_label, text_color=TEXT, progress_color=TEAL, width=46)
         self.ssl.select(); self.ssl.grid(row=0, column=4, sticky="e")
 
-        brow = ctk.CTkFrame(card, fg_color="transparent"); brow.grid(row=8, column=0, sticky="ew", pady=(14, 10), **pad)
+        self.mail_provider.set(self._mail_labels[0])               # default: GoDaddy
+        self._on_mail_provider(self._mail_labels[0])
+
+        brow = ctk.CTkFrame(card, fg_color="transparent"); brow.grid(row=11, column=0, sticky="ew", pady=(14, 10), **pad)
         brow.grid_columnconfigure(0, weight=1)
         self.runbtn = ctk.CTkButton(brow, text="Back up my data", height=42, corner_radius=8, font=self.f_btn,
                                     fg_color=TEAL, hover_color=TEAL_HOVER, text_color=WHITE, command=self.run_backup)
@@ -168,6 +261,12 @@ class App(ctk.CTk):
         self.cancelbtn = ctk.CTkButton(brow, text="Cancel", width=104, height=42, corner_radius=8, font=self.f_btn,
                                        fg_color=WHITE, text_color=RED, border_color=RED, border_width=1,
                                        hover_color="#FBEAEA", command=self._cancel)
+
+        self.verifybtn = ctk.CTkButton(card, text="Verify a backup folder…", height=34, corner_radius=8,
+                                       font=self.f_label, fg_color=WHITE, text_color=NAVY,
+                                       border_color=BORDER, border_width=1, hover_color=LIGHT_GREY,
+                                       command=self.run_verify)
+        self.verifybtn.grid(row=12, column=0, sticky="ew", padx=8, pady=(0, 10))
 
     # ============================ RESTORE TAB (scaffold) ============================
     def _build_restore_tab(self, tab):
@@ -249,22 +348,23 @@ class App(ctk.CTk):
 
     def _busy(self, on, which="backup"):
         self.running = on
-        if which == "backup":
-            btn = self.runbtn
-        elif which == "login":
-            btn = self.google_login_btn
-        else:
-            btn = self.r_btn
-            
         if on:
             if which == "login":
-                btn.configure(state="disabled", text="Authenticating…")
+                self.google_login_btn.configure(text="Authenticating…")
+            elif which == "verify":
+                self.verifybtn.configure(text="Verifying…")
+            elif which == "restore":
+                self.r_btn.configure(text="Working…")
             else:
-                btn.configure(state="disabled", text="Working…")
+                self.runbtn.configure(text="Working…")
+            # lock every action button so two runs can't overlap
+            for b in (self.runbtn, self.verifybtn, self.r_btn, self.google_login_btn):
+                b.configure(state="disabled")
         else:
             self.runbtn.configure(state="normal", text="Back up my data")
             self.google_login_btn.configure(state="normal", text="Sign in with Google")
             self.r_btn.configure(state="normal", text="Upload to Gmail")
+            self.verifybtn.configure(state="normal", text="Verify a backup folder…")
             self.cancelbtn.grid_forget()
 
     # ---- google login run ----
@@ -299,6 +399,7 @@ class App(ctk.CTk):
         if not dest or not os.path.isdir(dest): self._write("⚠  Pick a valid folder to save into."); return
         if not port.isdigit(): self._write("⚠  Port must be a number (usually 993)."); return
         self.stop_event.clear(); self.bar.set(0); self._busy(True, "backup")
+        self.current_op = "backup"
         self.cancelbtn.grid(row=0, column=1, padx=(10, 0)); self.status.configure(text="Connecting…", text_color=MUTED)
         
         # Reset transfer stats for progress/ETA tracking
@@ -306,15 +407,19 @@ class App(ctk.CTk):
         self.accumulated_bytes = 0
         
         args = dict(host=self.host.get().strip(), port=int(port), ssl=bool(self.ssl.get()), user=user,
-                    password=pw, dest=dest, dry_run=dry, insecure=bool(self.insecure_var.get()))
+                    password=pw, dest=dest, dry_run=dry, insecure=bool(self.insecure_var.get()),
+                    make_mbox=bool(self.mbox.get()))
         dav = dict(host=self.caldav_host.get().strip() or "am1.myprofessionalmail.com",
                    insecure=bool(self.insecure_var.get())) if self.do_dav.get() else None
-        threading.Thread(target=self._worker_backup, args=(args, list(self.archive_zips), dav), daemon=True).start()
+        threading.Thread(target=self._worker_backup,
+                         args=(args, list(self.archive_zips), dav, bool(self.auto_verify.get())),
+                         daemon=True).start()
 
-    def _worker_backup(self, args, zips, dav):
+    def _worker_backup(self, args, zips, dav, auto_verify):
         def log(s): self.q.put(("log", s))
         def prog(d, t, bytes_diff=0): self.q.put(("prog", (d, t, bytes_diff)))
         try:
+            # backup -> verify backup -> if a file is corrupt/missing, redownload it
             res = backup(log=log, progress=prog, should_stop=self.stop_event.is_set, **args)
             if dav and not args["dry_run"] and not self.stop_event.is_set():
                 log("\n— calendar, contacts & tasks (CalDAV / CardDAV) —")
@@ -331,6 +436,15 @@ class App(ctk.CTk):
             if zips and not self.stop_event.is_set() and res.get("dest"):
                 log("\n— folding in your data export (Drive etc.) —")
                 fold_in_data_export(zips, res["dest"], dry_run=args["dry_run"], log=log)
+            if auto_verify and not args["dry_run"] and not self.stop_event.is_set() and res.get("dest"):
+                try:
+                    self.q.put(("phase", "verify"))
+                    vres = verify_and_repair(log=log, progress=prog,
+                                             should_stop=self.stop_event.is_set, **args)
+                    res["verify"] = vres
+                    res["ok"] = bool(res.get("ok")) and bool(vres.get("ok"))
+                except Exception as e:
+                    log("\n[verify error] %s" % translate_error(e))
             self.q.put(("done", res))
         except Exception as e:
             self.q.put(("log", "\n[error] %s" % translate_error(e))); self.q.put(("done", {"ok": False}))
@@ -345,7 +459,8 @@ class App(ctk.CTk):
         if not self.google_tokens:
             self._write("⚠  Please sign in with Google first."); return
         self.stop_event.clear()
-        self.bar.set(0); self._busy(True, "restore"); self.status.configure(text="Reading backup…", text_color=MUTED)
+        self.bar.set(0); self._busy(True, "restore"); self.current_op = "restore"
+        self.status.configure(text="Reading backup…", text_color=MUTED)
         
         # Reset transfer stats for progress/ETA tracking
         self.transfer_start_time = time.time()
@@ -363,6 +478,29 @@ class App(ctk.CTk):
             self.q.put(("done_restore", res))
         except Exception as e:
             self.q.put(("log", "\n[error] %s" % translate_error(e))); self.q.put(("done_restore", {"ok": False}))
+
+    def run_verify(self):
+        if self.running:
+            return
+        start = self.last_backup_path or self.dest.get().strip() or os.path.expanduser("~")
+        folder = filedialog.askdirectory(title="Pick the backup folder to verify", initialdir=start)
+        if not folder:
+            return
+        self.stop_event.clear(); self.bar.set(0); self._busy(True, "verify"); self.current_op = "verify"
+        self.cancelbtn.grid(row=0, column=1, padx=(10, 0))
+        self.status.configure(text="Verifying backup…", text_color=MUTED)
+        self.transfer_start_time = time.time(); self.accumulated_bytes = 0
+        threading.Thread(target=self._worker_verify, args=(folder,), daemon=True).start()
+
+    def _worker_verify(self, folder):
+        def log(s): self.q.put(("log", s))
+        def prog(d, t, b=0): self.q.put(("prog", (d, t, b)))
+        try:
+            res = verify_backup(folder, log=log, progress=prog, should_stop=self.stop_event.is_set)
+            self.q.put(("done_verify", res))
+        except Exception as e:
+            self.q.put(("log", "\n[error] %s" % translate_error(e)))
+            self.q.put(("done_verify", {"ok": False}))
 
     def _cancel(self):
         self.stop_event.set(); self.status.configure(text="Stopping…", text_color=RED)
@@ -393,9 +531,12 @@ class App(ctk.CTk):
                         else:
                             eta_str = "ETA: Calibrating"
                             
-                    # Determine progress verb
-                    if self.r_btn.cget("state") == "disabled":
+                    # Determine progress verb from the current operation
+                    op = getattr(self, "current_op", "backup")
+                    if op == "restore":
                         verb = "Uploading"
+                    elif op == "verify":
+                        verb = "Verifying"
                     else:
                         verb = "Checking" if bool(self.dry.get()) else "Downloading"
                         
@@ -403,6 +544,8 @@ class App(ctk.CTk):
                         text=f"{verb} {d} / {t} items | {speed_str} | {eta_str}", 
                         text_color=MUTED
                     )
+                elif kind == "phase":
+                    self.current_op = payload
                 elif kind == "oauth_done":
                     self._busy(False)
                     access_token, refresh_token, email = payload
@@ -421,12 +564,26 @@ class App(ctk.CTk):
                         self.last_backup_path = payload["dest"]
                         self.r_src.delete(0, "end")
                         self.r_src.insert(0, self.last_backup_path)
+                    vres = payload.get("verify")
                     if payload.get("dry_run"):
                         self.status.configure(text="Dry run complete — email login OK.", text_color=GREEN)
                     elif payload.get("ok"):
-                        self.bar.set(1); self.status.configure(text="Done — your backup is complete.", text_color=GREEN)
+                        self.bar.set(1)
+                        if vres and vres.get("repaired"):
+                            self.status.configure(
+                                text="Done — verified, re-downloaded %d file(s) that failed the first check."
+                                     % vres["repaired"], text_color=GREEN)
+                        elif vres:
+                            self.status.configure(text="Done — backup verified, all files intact.", text_color=GREEN)
+                        else:
+                            self.status.configure(text="Done — your backup is complete.", text_color=GREEN)
                     else:
-                        self.status.configure(text="Finished with problems — check the log.", text_color=RED)
+                        if vres and not vres.get("ok"):
+                            self.status.configure(
+                                text="Backup finished but verification still found problems — check the log.",
+                                text_color=RED)
+                        else:
+                            self.status.configure(text="Finished with problems — check the log.", text_color=RED)
                 elif kind == "done_restore":
                     self._busy(False)
                     if payload.get("ok"):
@@ -434,6 +591,15 @@ class App(ctk.CTk):
                         self.status.configure(text="Done — restore completed successfully.", text_color=GREEN)
                     else:
                         self.status.configure(text="Restore finished with problems — check the log.", text_color=RED)
+                elif kind == "done_verify":
+                    self._busy(False)
+                    if payload.get("stopped"):
+                        self.status.configure(text="Verification stopped.", text_color=RED)
+                    elif payload.get("ok"):
+                        self.bar.set(1)
+                        self.status.configure(text="Verified — all files intact.", text_color=GREEN)
+                    else:
+                        self.status.configure(text="Verification found problems — check the log.", text_color=RED)
         except queue.Empty:
             pass
         self.after(100, self._drain)

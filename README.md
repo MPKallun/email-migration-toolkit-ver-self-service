@@ -24,10 +24,13 @@ Get the latest build from **Releases**:
 - **Windows** — download `Data Backup.exe`.
 
 **First launch (the app is unsigned):**
-- macOS — right-click the app → **Open** → **Open**. (On newer macOS: **System Settings → Privacy & Security → Open Anyway**.)
-- Windows — **More info → Run anyway**.
 
-*(The one-time warning is only because the app isn’t code-signed; signing is optional and costs money — see “Building”.)*
+- **macOS** — on recent macOS (Sequoia and later) the old right-click → **Open** trick no longer shows an Open button. Use either:
+  - *Terminal (fastest):* drag the app into **Applications**, then run `xattr -dr com.apple.quarantine "/Applications/Data Backup.app"` and open it normally.
+  - *System Settings:* double-click the app once (click **Done**), then go to **System Settings → Privacy & Security → Open Anyway** and confirm.
+- **Windows** — on the **"Windows protected your PC"** prompt, click **More info → Run anyway**.
+
+*(The one-time warning is only because the app isn’t code-signed; signing is optional and costs money — see “Building”. Full step-by-step instructions are in the release notes.)*
 
 ### Alternative: Run via Launcher Script (Bypass all OS security blocks)
 

@@ -29,7 +29,7 @@ import urllib.parse
 import webbrowser
 import base64
 from http.server import BaseHTTPRequestHandler, HTTPServer
-from utils import translate_error, retry, log_debug
+from utils import translate_error, retry, log_debug, load_dotenv
 
 def execute_urllib_request(req, log_fn, max_attempts=5, initial_delay=1.5, backoff=2.0):
     import urllib.error
@@ -75,11 +75,14 @@ urllib.request.urlopen = _safe_urlopen
 
 # ============================================================================
 # DEVELOPER CREDENTIALS
-# Put your EAHI App credentials here. Once set, your end-users never have to 
-# touch GCP or configure anything—they just click "Login with Google".
+# Loaded from environment variables (see .env.example at the project root).
+# Copy .env.example -> .env and fill in your GCP OAuth "Desktop app" Client ID
+# / Secret. Once set, end-users never have to touch GCP -- they just click
+# "Login with Google". Never commit the real .env (already in .gitignore).
 # ============================================================================
-CLIENT_ID = "422424523488-heh155qmp0dtitcnqbq3l9qlqmi2ut47.apps.googleusercontent.com"
-CLIENT_SECRET = "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"
+load_dotenv()
+CLIENT_ID = os.environ.get("GOOGLE_CLIENT_ID", "")
+CLIENT_SECRET = os.environ.get("GOOGLE_CLIENT_SECRET", "")
 
 OAUTH_SCOPE = "https://www.googleapis.com/auth/gmail.modify https://www.googleapis.com/auth/userinfo.email https://www.googleapis.com/auth/contacts https://www.googleapis.com/auth/calendar https://www.googleapis.com/auth/tasks"
 
@@ -174,9 +177,9 @@ class OAuthCallbackHandler(BaseHTTPRequestHandler):
 # ---- Start Local Server and execute OAuth browser redirect ------------------
 def authenticate_google(log_fn=print, insecure=False):
     """Starts local server, opens browser, and returns (access_token, refresh_token, email)."""
-    if CLIENT_ID.startswith("YOUR_CLIENT"):
-        log_fn("⚠  Developer Client ID and Client Secret have not been set in gmail_upload.py.")
-        log_fn("   Please set them inside src/gmail_upload.py under 'DEVELOPER CREDENTIALS'.")
+    if not CLIENT_ID or not CLIENT_SECRET:
+        log_fn("⚠  Google Client ID / Client Secret are not set.")
+        log_fn("   Copy .env.example to .env at the project root and fill them in.")
         return None
 
     global INSECURE_MODE
